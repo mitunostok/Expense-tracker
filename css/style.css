@@ -219,6 +219,17 @@ main { outline: none; display: flex; flex-direction: column; gap: 12px; }
 .budget-status { font-size: 13px; margin-top: 4px; color: var(--text-2); display: flex; justify-content: space-between; }
 .budget-status .over { color: var(--neg); font-weight: 600; }
 
+/* Goals, comparisons, history summary */
+.goal { display: block; width: 100%; text-align: left; border: 0; }
+.goal .budget-status span:first-child { min-width: 0; }
+.delta { font-size: 14px; font-weight: 600; margin-top: 2px; }
+.delta .muted { font-weight: 500; }
+.tx-amt .pos, .tx-amt .neg { font-weight: 700; }
+.hist-sum { font-size: 13px; color: var(--text-2); text-align: center; }
+.hist-sum b { color: var(--text); font-variant-numeric: tabular-nums; }
+.link.center { align-self: center; margin-top: -6px; }
+.summary.two { grid-template-columns: 1fr 1fr; }
+
 /* Settings list */
 .list-btn {
   display: flex; align-items: center; gap: 12px; width: 100%; min-height: 52px;

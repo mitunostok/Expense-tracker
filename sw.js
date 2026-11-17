@@ -1,5 +1,5 @@
 /* Offline support: cache the app shell, serve it cache-first, refresh in the background. */
-const CACHE = 'hisab-v1';
+const CACHE = 'hisab-v2';
 const ASSETS = [
   './', 'index.html', 'css/style.css', 'js/app.js', 'manifest.webmanifest',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png',

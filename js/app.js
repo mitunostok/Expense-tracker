@@ -71,6 +71,8 @@
       transactions: [],
       budgets: {},
       recurring: [],
+      loans: [],
+      goals: [],
       prefs: { expenseWallet: 'w_pocket', incomeWallet: 'w_salary' },
       lastBackup: null,
     };
@@ -78,7 +80,9 @@
   function migrate(d) {
     const base = defaultData();
     if (!d || typeof d !== 'object') return base;
-    for (const k of ['wallets', 'categories', 'transactions', 'recurring']) if (!Array.isArray(d[k])) d[k] = base[k];
+    for (const k of ['wallets', 'categories', 'transactions', 'recurring', 'loans', 'goals']) if (!Array.isArray(d[k])) d[k] = base[k];
+    for (const l of d.loans) if (!Array.isArray(l.payments)) l.payments = [];
+    for (const g of d.goals) if (!Array.isArray(g.moves)) g.moves = [];
     if (!d.budgets || typeof d.budgets !== 'object') d.budgets = {};
     if (!d.prefs || typeof d.prefs !== 'object') d.prefs = base.prefs;
     if (!d.wallets.length) d.wallets = base.wallets;
@@ -119,6 +123,7 @@
         if (t.toWalletId === wid) b += t.amount;
       }
     }
+    for (const e of extraEvents()) if (e.walletId === wid) b += EXTRA_SIGN[e.sub] * e.amount;
     return round2(b);
   }
   function monthTotals(m) {
@@ -140,6 +145,39 @@
       .filter((c) => c.type === 'expense' && db.budgets[c.id] > 0)
       .map((c) => { const b = db.budgets[c.id], s = spent[c.id] || 0; return { c, b, s, pct: (s / b) * 100 }; })
       .sort((a, b) => b.pct - a.pct);
+  }
+
+  /* ---------- loans & goals: money that moves between people/goals but isn't spending ---------- */
+  const loanPaid = (l) => round2((l.payments || []).reduce((s, p) => s + p.amount, 0));
+  const loanLeft = (l) => round2(l.amount - loanPaid(l));
+  const goalSaved = (g) => round2((g.moves || []).reduce((s, m) => s + m.amount, 0));
+  // How each event changes the balance of the wallet it touches.
+  const EXTRA_SIGN = { lent: -1, borrowed: 1, got: 1, paid: -1, add: -1, take: 1 };
+  function extraEvents() {
+    const ev = [];
+    for (const l of db.loans) {
+      ev.push({ id: 'L' + l.id, kind: 'loan', sub: l.kind, date: l.date, amount: l.amount, walletId: l.walletId, ref: l.id, person: l.person, note: l.note || '', created: l.created || 0 });
+      for (const p of l.payments || []) {
+        ev.push({ id: 'P' + p.id, kind: 'loan', sub: l.kind === 'lent' ? 'got' : 'paid', date: p.date, amount: p.amount, walletId: p.walletId, ref: l.id, person: l.person, note: '', created: p.created || 0 });
+      }
+    }
+    for (const g of db.goals) {
+      for (const m of g.moves || []) {
+        ev.push({ id: 'G' + m.id, kind: 'goal', sub: m.amount >= 0 ? 'add' : 'take', date: m.date, amount: Math.abs(m.amount), walletId: m.walletId, ref: g.id, person: g.name, icon: g.icon, note: '', created: m.created || 0 });
+      }
+    }
+    return ev;
+  }
+  const openLoans = () => {
+    const t = todayStr();
+    return db.loans.filter((l) => loanLeft(l) > 0).sort((a, b) => {
+      const oa = a.due && a.due < t ? 0 : 1, ob = b.due && b.due < t ? 0 : 1;
+      return oa - ob || a.date.localeCompare(b.date);
+    });
+  };
+  function monthsBetween(a, b) {
+    const [ya, ma] = a.split('-').map(Number), [yb, mb] = b.split('-').map(Number);
+    return (yb - ya) * 12 + (mb - ma);
   }
 
   /* ---------- repeating entries ---------- */
@@ -168,7 +206,8 @@
   }
 
   /* ---------- UI state ---------- */
-  const ui = { tab: 'home', month: thisMonth(), hist: { type: 'all', wallet: 'all', cat: null, q: '' }, statsType: 'expense', trendSel: null };
+  const resetHist = (o = {}) => ({ type: 'all', wallet: 'all', cat: null, q: '', range: 'month', from: '', to: '', ...o });
+  const ui = { tab: 'home', month: thisMonth(), hist: resetHist(), statsType: 'expense', trendSel: null, plan: 'budgets' };
 
   function monthBar() {
     const atNow = ui.month >= thisMonth();
@@ -180,7 +219,20 @@
   }
   const empty = (msg) => `<div class="empty">${msg}</div>`;
 
+  const EXTRA_TITLES = {
+    lent: (p) => `Lent to ${p}`, borrowed: (p) => `Borrowed from ${p}`, got: (p) => `${p} paid back`,
+    paid: (p) => `Paid back ${p}`, add: (p) => `Saved for ${p}`, take: (p) => `Took from ${p}`,
+  };
   function txRow(t) {
+    if (t.kind) {
+      const icon = t.kind === 'loan' ? '🤝' : (t.icon || '🎯');
+      const sub = walName(t.walletId) + (t.note ? ' · ' + t.note : '');
+      return `<button class="tx" data-act="${t.kind}" data-id="${t.ref}">
+        <span class="tx-icon" aria-hidden="true">${esc(icon)}</span>
+        <span class="tx-main"><span class="tx-title">${esc(EXTRA_TITLES[t.sub](t.person))}</span><span class="tx-sub">${esc(sub)}</span></span>
+        <span class="tx-amt muted">${EXTRA_SIGN[t.sub] > 0 ? '+' : '−'}${fmt(t.amount)}</span>
+      </button>`;
+    }
     let icon, title, sub, cls = '', sign = '';
     if (t.type === 'transfer') {
       icon = '⇄'; title = `${walName(t.walletId)} → ${walName(t.toWalletId)}`; sub = 'Moved money';
@@ -218,13 +270,16 @@
     const total = wallets.reduce((s, w) => s + balance(w.id), 0);
     const { inc, exp } = monthTotals(ui.month);
     const alerts = budgetRows(ui.month).filter((r) => r.pct >= 80);
-    const recent = sortTx(txInMonth(ui.month)).slice(0, 6);
-    const fresh = db.transactions.length === 0;
+    const recent = sortTx([...txInMonth(ui.month), ...extraEvents().filter((e) => monthOf(e.date) === ui.month)]).slice(0, 6);
+    const fresh = db.transactions.length === 0 && db.loans.length === 0;
+    const goalsTotal = db.goals.reduce((s, g) => s + goalSaved(g), 0);
+    const open = openLoans();
     return `
       ${!storageOk ? `<div class="warn-note">⚠️ This browser is blocking storage, so entries will not be saved. Try opening the app normally (not in a private window).</div>` : ''}
       <section class="card hero">
         <div class="label">Total money left</div>
         <div class="hero-num ${total < 0 ? 'neg' : ''}">${fmt(total)}</div>
+        ${goalsTotal > 0 ? `<div class="note" style="margin:-10px 0 12px">+ ${fmt(goalsTotal)} set aside in savings goals</div>` : ''}
         <div class="wallets">${wallets.map((w) => {
           const b = balance(w.id);
           return `<button class="wallet" data-act="wallet-hist" data-id="${w.id}">
@@ -245,7 +300,8 @@
         <div class="stat"><div class="label">Spent</div><div class="num">${fmt(exp)}</div></div>
         <div class="stat"><div class="label">Saved</div><div class="num ${inc - exp < 0 ? 'neg' : ''}">${fmt(inc - exp)}</div></div>
       </section>
-      ${alerts.length ? `<section class="card"><div class="card-head"><h3>Budget alerts</h3><button class="link" data-act="tab" data-tab="budgets">All budgets</button></div>${alerts.map(budgetRowHtml).join('')}</section>` : ''}
+      ${alerts.length ? `<section class="card"><div class="card-head"><h3>Budget alerts</h3><button class="link" data-act="tab" data-tab="budgets" data-plan="budgets">All budgets</button></div>${alerts.map(budgetRowHtml).join('')}</section>` : ''}
+      ${open.length ? `<section class="card"><div class="card-head"><h3>🤝 Lent & borrowed</h3><button class="link" data-act="tab" data-tab="budgets" data-plan="loans">See all</button></div>${open.slice(0, 3).map(loanRow).join('')}</section>` : ''}
       <section class="card">
         <div class="card-head"><h3>Recent</h3>${recent.length ? '<button class="link" data-act="tab" data-tab="hist">See all</button>' : ''}</div>
         ${recent.length ? recent.map(txRow).join('') : empty('No entries this month yet. Tap + to add one.')}
@@ -254,19 +310,26 @@
 
   function histList() {
     const h = ui.hist;
-    let list = txInMonth(ui.month);
-    if (h.type !== 'all') list = list.filter((t) => t.type === h.type);
+    const inRange = (d) => (h.range === 'custom' ? (!h.from || d >= h.from) && (!h.to || d <= h.to) : monthOf(d) === ui.month);
+    let list = [...db.transactions, ...extraEvents()].filter((t) => inRange(t.date));
+    if (h.type === 'transfer') list = list.filter((t) => t.type === 'transfer' || t.kind);
+    else if (h.type !== 'all') list = list.filter((t) => t.type === h.type);
     if (h.wallet !== 'all') list = list.filter((t) => t.walletId === h.wallet || t.toWalletId === h.wallet);
     if (h.cat) list = list.filter((t) => t.categoryId === h.cat);
     const q = h.q.trim().toLowerCase();
     if (q) {
-      list = list.filter((t) => [t.note, cat(t.categoryId)?.name, walName(t.walletId), t.toWalletId && walName(t.toWalletId), String(t.amount)]
+      list = list.filter((t) => [t.note, t.person, cat(t.categoryId)?.name, walName(t.walletId), t.toWalletId && walName(t.toWalletId), String(t.amount)]
         .some((s) => s && String(s).toLowerCase().includes(q)));
     }
-    if (!list.length) return empty(q || h.type !== 'all' || h.wallet !== 'all' || h.cat ? 'Nothing matches these filters.' : 'No entries in this month.');
+    if (!list.length) {
+      return empty(q || h.type !== 'all' || h.wallet !== 'all' || h.cat ? 'Nothing matches these filters.'
+        : h.range === 'custom' ? 'No entries between these dates.' : 'No entries in this month.');
+    }
+    let spentAll = 0, incAll = 0;
+    for (const t of list) { if (t.type === 'expense') spentAll += t.amount; else if (t.type === 'income') incAll += t.amount; }
     const groups = new Map();
     for (const t of sortTx(list)) { if (!groups.has(t.date)) groups.set(t.date, []); groups.get(t.date).push(t); }
-    let html = '';
+    let html = `<div class="hist-sum">${list.length} ${list.length === 1 ? 'entry' : 'entries'} · Spent <b>${fmt(spentAll)}</b> · Income <b>${fmt(incAll)}</b></div>`;
     for (const [d, items] of groups) {
       const spent = items.filter((t) => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
       html += `<div class="day-head"><span>${dayLabel(d)}</span><span>${spent ? 'Spent ' + fmt(spent) : ''}</span></div>
@@ -277,8 +340,17 @@
   function viewHist() {
     const h = ui.hist;
     const seg = [['all', 'All'], ['expense', 'Expense'], ['income', 'Income'], ['transfer', 'Moves']];
-    const c = h.cat && cat(h.cat);
-    return `${monthBar()}
+    const catOpts = (type, label) => `<optgroup label="${label}">${db.categories
+      .filter((c) => c.type === type && (!c.hidden || c.id === h.cat))
+      .map((c) => `<option value="${c.id}" ${h.cat === c.id ? 'selected' : ''}>${esc(c.icon + ' ' + c.name)}</option>`).join('')}</optgroup>`;
+    const top = h.range === 'custom'
+      ? `<div class="row2">
+          <label class="field">From<input class="input" type="date" id="hist-from" value="${esc(h.from)}"></label>
+          <label class="field">To<input class="input" type="date" id="hist-to" value="${esc(h.to)}"></label>
+        </div>
+        <button class="link center" data-act="hist-range" data-k="month">← Back to monthly view</button>`
+      : `${monthBar()}<button class="link center" data-act="hist-range" data-k="custom">📅 Choose any dates</button>`;
+    return `${top}
       <div class="filters">
         <div class="seg" role="group" aria-label="Type">${seg.map(([k, l]) => `<button data-act="hist-type" data-k="${k}" aria-pressed="${h.type === k}">${l}</button>`).join('')}</div>
         <div class="filter-row">
@@ -286,9 +358,11 @@
             <option value="all">All wallets</option>
             ${db.wallets.map((w) => `<option value="${w.id}" ${h.wallet === w.id ? 'selected' : ''}>${esc(w.icon + ' ' + w.name)}</option>`).join('')}
           </select>
-          <input class="input" id="hist-q" type="search" placeholder="Search notes, categories…" value="${esc(h.q)}" aria-label="Search">
+          <select class="input" id="hist-cat" aria-label="Category">
+            <option value="all">All categories</option>${catOpts('expense', 'Expense')}${catOpts('income', 'Income')}
+          </select>
         </div>
-        ${c ? `<button class="chip-filter" data-act="clear-cat">${esc(c.icon + ' ' + c.name)} ✕</button>` : ''}
+        <input class="input" id="hist-q" type="search" placeholder="Search notes, people, categories…" value="${esc(h.q)}" aria-label="Search">
       </div>
       <div id="hist-list">${histList()}</div>`;
   }
@@ -336,6 +410,26 @@
     const max = rows[0]?.v || 1;
     const pct = (v) => { const p = (v / total) * 100; return p < 1 ? '<1' : Math.round(p); };
     const byWallet = Object.entries(sumBy(ui.month, type, 'walletId')).sort((a, b) => b[1] - a[1]);
+    // Compare with the previous month. For spending, going up is bad; for income, going up is good.
+    const prev = addMonth(ui.month, -1);
+    const prevBy = sumBy(prev, type, 'categoryId');
+    const prevTotal = Object.values(prevBy).reduce((s, v) => s + v, 0);
+    const arrow = (d) => {
+      const good = (d > 0) !== (type === 'expense');
+      return `<span class="${good ? 'pos' : 'neg'}">${d > 0 ? '▲' : '▼'} ${fmt(Math.abs(d))}</span>`;
+    };
+    let delta = '';
+    if (prevTotal > 0) {
+      const d = round2(total - prevTotal);
+      delta = Math.abs(d) < 1 ? `<div class="delta muted">Same as ${monthLabel(prev)}</div>`
+        : `<div class="delta">${arrow(d)} <span class="muted">(${Math.round((Math.abs(d) / prevTotal) * 100)}%) ${d > 0 ? 'more' : 'less'} than ${monthLabel(prev)}</span></div>`;
+    } else if (total > 0) delta = `<div class="delta muted">Nothing recorded in ${monthLabel(prev)} to compare with.</div>`;
+    const changes = [...new Set([...Object.keys(by), ...Object.keys(prevBy)])]
+      .map((id) => ({ id, c: cat(id), cur: by[id] || 0, old: prevBy[id] || 0 }))
+      .map((x) => ({ ...x, d: round2(x.cur - x.old) }))
+      .filter((x) => Math.abs(x.d) >= 1)
+      .sort((a, b) => Math.abs(b.d) - Math.abs(a.d))
+      .slice(0, 6);
     return `${monthBar()}
       <div class="seg" role="group" aria-label="Report type">
         <button data-act="stats-type" data-k="expense" aria-pressed="${type === 'expense'}">Spending</button>
@@ -344,6 +438,7 @@
       <section class="card">
         <div class="label">${type === 'expense' ? 'Total spent' : 'Total income'} in ${monthLabel(ui.month)}</div>
         <div class="big-num">${fmt(total)}</div>
+        ${delta}
         <div style="margin-top:8px">
         ${rows.length ? rows.map((r) => `<button class="rank" data-act="cat-hist" data-id="${r.id}">
             <div class="rank-top"><span class="rank-name">${esc(r.c?.icon || '❔')} ${esc(r.c?.name || 'Unknown')}</span><span class="rank-val">${fmt(r.v)}<small>${pct(r.v)}%</small></span></div>
@@ -351,6 +446,11 @@
           : empty(type === 'expense' ? 'No spending recorded this month.' : 'No income recorded this month.')}
         </div>
       </section>
+      ${prevTotal > 0 && changes.length ? `<section class="card"><h3>Biggest changes since ${monthLabel(prev)}</h3>
+        ${changes.map((x) => `<button class="tx" data-act="cat-hist" data-id="${x.id}">
+          <span class="tx-icon" aria-hidden="true">${esc(x.c?.icon || '❔')}</span>
+          <span class="tx-main"><span class="tx-title">${esc(x.c?.name || 'Unknown')}</span><span class="tx-sub">${fmt(x.old)} → ${fmt(x.cur)}</span></span>
+          <span class="tx-amt">${arrow(x.d)}</span></button>`).join('')}</section>` : ''}
       ${byWallet.length > 1 ? `<section class="card"><h3>${type === 'expense' ? 'Paid from' : 'Received in'}</h3>
         ${byWallet.map(([id, v]) => `<div class="rank"><div class="rank-top"><span class="rank-name">${esc((wal(id)?.icon || '') + ' ' + walName(id))}</span><span class="rank-val">${fmt(v)}<small>${pct(v)}%</small></span></div>
           <div class="track"><div class="fill" style="width:${(v / byWallet[0][1]) * 100}%"></div></div></div>`).join('')}</section>` : ''}
@@ -377,6 +477,67 @@
       : `<section class="card"><h3>No budgets yet</h3><p class="note">Set a monthly limit for any category, like ₹3,000 for Food. Each bar turns yellow at 80% and red when you go over.</p></section>`}
       <button class="btn primary block" data-act="set-budgets">${rows.length ? 'Edit budgets' : 'Set budgets'}</button>
       <p class="note" style="text-align:center">Budgets repeat every month.</p>`;
+  }
+
+  function viewPlan() {
+    const seg = [['budgets', 'Budgets'], ['goals', 'Goals'], ['loans', 'Lent & borrowed']];
+    const body = ui.plan === 'goals' ? viewGoals() : ui.plan === 'loans' ? viewLoans() : viewBudgets();
+    return `<div class="seg" role="group" aria-label="Plan section">${seg.map(([k, l]) => `<button data-act="plan" data-k="${k}" aria-pressed="${ui.plan === k}">${l}</button>`).join('')}</div>${body}`;
+  }
+
+  function goalCard(g) {
+    const s = goalSaved(g), pct = Math.min(100, (s / g.target) * 100), done = s >= g.target;
+    let plan = '';
+    if (!done && g.deadline) {
+      const months = monthsBetween(thisMonth(), g.deadline) + 1;
+      plan = months > 0 ? ` · ${fmt(Math.ceil((g.target - s) / months))}/month to reach it by ${monthLabel(g.deadline)}` : ' · ⚠️ target date has passed';
+    }
+    return `<button class="card goal" data-act="goal" data-id="${g.id}">
+      <div class="budget-top"><span class="rank-name">${esc(g.icon)} ${esc(g.name)}</span><span class="rank-val">${fmt(s)} <small>of ${fmt(g.target)}</small></span></div>
+      <div class="track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}" aria-label="${esc(g.name)} progress"><div class="fill" style="width:${pct}%"></div></div>
+      <div class="budget-status"><span>${done ? '🎉 Goal reached!' : fmt(g.target - s) + ' to go'}${esc(plan)}</span><span>${Math.round(pct)}%</span></div>
+    </button>`;
+  }
+  function viewGoals() {
+    const total = db.goals.reduce((s, g) => s + goalSaved(g), 0);
+    return `${db.goals.length
+      ? `<section class="card"><div class="label">Set aside in goals</div><div class="big-num">${fmt(total)}</div>
+          <p class="note" style="margin:4px 0 0">Money you add to a goal leaves its wallet, so you won't spend it by accident. Take it out any time.</p></section>
+        ${db.goals.map(goalCard).join('')}`
+      : `<section class="card"><h3>No savings goals yet</h3><p class="note">Saving for a phone, a trip or an emergency fund? Make a goal and add money to it whenever you can.</p></section>`}
+      <button class="btn primary block" data-act="goal-new">＋ New goal</button>`;
+  }
+
+  function loanTitle(l) {
+    if (loanLeft(l) <= 0) return `${l.person} · settled`;
+    return l.kind === 'lent' ? `${l.person} owes you` : `You owe ${l.person}`;
+  }
+  function loanRow(l) {
+    const left = loanLeft(l);
+    let sub = `${l.kind === 'lent' ? 'Lent' : 'Borrowed'} ${fmt(l.amount)} · ${dayLabel(l.date)}`;
+    if (left > 0 && l.due) sub = (l.due < todayStr() ? '⚠️ Overdue since ' : 'Settle by ') + dayLabel(l.due) + ' · ' + sub;
+    return `<button class="tx" data-act="loan" data-id="${l.id}">
+      <span class="tx-icon" aria-hidden="true">${l.kind === 'lent' ? '📤' : '📥'}</span>
+      <span class="tx-main"><span class="tx-title">${esc(loanTitle(l))}</span><span class="tx-sub">${esc(sub)}</span></span>
+      <span class="tx-amt ${left > 0 ? '' : 'muted'}">${fmt(left > 0 ? left : l.amount)}</span>
+    </button>`;
+  }
+  function viewLoans() {
+    const open = openLoans();
+    const closed = db.loans.filter((l) => loanLeft(l) <= 0).sort((a, b) => b.date.localeCompare(a.date));
+    const owed = open.filter((l) => l.kind === 'lent').reduce((s, l) => s + loanLeft(l), 0);
+    const owe = open.filter((l) => l.kind === 'borrowed').reduce((s, l) => s + loanLeft(l), 0);
+    return `<section class="summary two">
+        <div class="stat"><div class="label">People owe you</div><div class="num">${fmt(owed)}</div></div>
+        <div class="stat"><div class="label">You owe</div><div class="num">${fmt(owe)}</div></div>
+      </section>
+      <div class="actions">
+        <button class="btn primary" style="flex:1" data-act="loan-new" data-k="lent">📤 I lent money</button>
+        <button class="btn primary" style="flex:1" data-act="loan-new" data-k="borrowed">📥 I borrowed</button>
+      </div>
+      <section class="card"><h3>Not settled yet</h3>${open.length ? open.map(loanRow).join('') : empty('Nothing pending.')}</section>
+      ${closed.length ? `<section class="card"><h3>Settled</h3>${closed.slice(0, 10).map(loanRow).join('')}</section>` : ''}
+      <p class="note" style="text-align:center">Lending and borrowing change your wallet balance, but they don't count as spending or income.</p>`;
   }
 
   function viewMore() {
@@ -413,8 +574,8 @@
       <p class="note" style="text-align:center">Hisab · works offline · no account needed</p>`;
   }
 
-  const TITLES = { home: '', hist: 'History', stats: 'Reports', budgets: 'Budgets', more: 'Settings' };
-  const VIEWS = { home: viewHome, hist: viewHist, stats: viewStats, budgets: viewBudgets, more: viewMore };
+  const TITLES = { home: '', hist: 'History', stats: 'Reports', budgets: 'Plan', more: 'Settings' };
+  const VIEWS = { home: viewHome, hist: viewHist, stats: viewStats, budgets: viewPlan, more: viewMore };
   function render() {
     $('#view').innerHTML = VIEWS[ui.tab]();
     $('#topbar-title').textContent = TITLES[ui.tab];
@@ -425,6 +586,10 @@
   function bindHist() {
     $('#hist-wallet').addEventListener('change', (e) => { ui.hist.wallet = e.target.value; $('#hist-list').innerHTML = histList(); });
     $('#hist-q').addEventListener('input', (e) => { ui.hist.q = e.target.value; $('#hist-list').innerHTML = histList(); });
+    $('#hist-cat').addEventListener('change', (e) => { ui.hist.cat = e.target.value === 'all' ? null : e.target.value; $('#hist-list').innerHTML = histList(); });
+    for (const k of ['from', 'to']) {
+      $('#hist-' + k)?.addEventListener('change', (e) => { ui.hist[k] = e.target.value; $('#hist-list').innerHTML = histList(); });
+    }
   }
   function go(tab) { ui.tab = tab; render(); window.scrollTo(0, 0); }
 
@@ -707,7 +872,7 @@
           if (e.target.closest('[data-back]')) return openWallets();
           if (e.target.closest('[data-del]')) {
             if (visibleWallets().length <= 1) { $('#w-err', sheet).textContent = 'You need at least one wallet.'; return; }
-            const used = db.transactions.some((t) => t.walletId === w.id || t.toWalletId === w.id);
+            const used = db.transactions.some((t) => t.walletId === w.id || t.toWalletId === w.id) || extraEvents().some((ev) => ev.walletId === w.id);
             if (!confirm(`Delete wallet "${w.name}"?${used ? ' Past entries stay in your history.' : ''}`)) return;
             if (used) wal(w.id).hidden = true; else db.wallets = db.wallets.filter((x) => x.id !== w.id);
             db.recurring = db.recurring.filter((r) => r.walletId !== w.id && r.toWalletId !== w.id);
@@ -744,6 +909,248 @@
     });
   }
 
+  /* ---------- shared bits for goal & loan sheets ---------- */
+  const parseAmt = (s) => round2(String(s ?? '').replace(/[,₹\s]/g, ''));
+  const usableWallet = (id) => (id && wal(id) && !wal(id).hidden ? id : visibleWallets()[0]?.id);
+  function walletChipsHtml(sel) {
+    return `<div class="chips">${visibleWallets().map((w) =>
+      `<button type="button" class="chip" data-w="${w.id}" aria-pressed="${w.id === sel}">${esc(w.icon)} ${esc(w.name)} <small>${fmt(balance(w.id))}</small></button>`).join('')}</div>`;
+  }
+  function pickWallet(root, set) {
+    root.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-w]');
+      if (!b) return;
+      $$('[data-w]', root).forEach((x) => x.setAttribute('aria-pressed', x === b));
+      set(b.dataset.w);
+    });
+  }
+
+  /* ---------- savings goals ---------- */
+  const GOAL_ICONS = ['🎯', '📱', '💻', '🏍️', '🚗', '✈️', '🏠', '💍', '🎓', '🏥', '🎁', '🐷', '🛟', '📷', '🎮', '👶'];
+  function editGoal(g) {
+    const isNew = !g;
+    const cur = g || { name: '', icon: '🎯', target: '', deadline: '' };
+    let icon = cur.icon;
+    const icons = GOAL_ICONS.includes(icon) ? GOAL_ICONS : [icon, ...GOAL_ICONS];
+    openSheet(isNew ? 'New savings goal' : 'Edit goal', `
+      <label class="field">What are you saving for?<input class="input" id="g-name" maxlength="30" placeholder="e.g. New phone" value="${esc(cur.name)}"></label>
+      <div class="emoji-row">${icons.map((e) => `<button type="button" data-e="${esc(e)}" aria-pressed="${e === icon}">${esc(e)}</button>`).join('')}</div>
+      <div class="row2">
+        <label class="field">Target amount<input class="input" id="g-target" inputmode="decimal" placeholder="₹" value="${cur.target || ''}"></label>
+        <label class="field">By (optional)<input class="input" type="month" id="g-deadline" min="${thisMonth()}" value="${esc(cur.deadline || '')}"></label>
+      </div>
+      <div class="err" id="g-err"></div>
+      <div class="actions">
+        <button class="btn" data-back>Cancel</button>
+        <button class="btn primary" data-save>Save goal</button>
+      </div>`, (sheet) => {
+      if (isNew) setTimeout(() => $('#g-name', sheet)?.focus(), 50);
+      sheet.addEventListener('click', (e) => {
+        const em = e.target.closest('[data-e]');
+        if (em) { icon = em.dataset.e; $$('[data-e]', sheet).forEach((x) => x.setAttribute('aria-pressed', x === em)); return; }
+        if (e.target.closest('[data-back]')) return isNew ? closeSheet() : openGoal(g.id);
+        if (!e.target.closest('[data-save]')) return;
+        const name = $('#g-name', sheet).value.trim();
+        const target = parseAmt($('#g-target', sheet).value);
+        const deadline = $('#g-deadline', sheet).value;
+        if (!name) { $('#g-err', sheet).textContent = 'Give the goal a name.'; return; }
+        if (!(target > 0)) { $('#g-err', sheet).textContent = 'Enter a target amount.'; return; }
+        let id;
+        if (isNew) { id = 'g' + uid(); db.goals.push({ id, name, icon, target, deadline, moves: [], created: Date.now() }); }
+        else { id = g.id; Object.assign(g, { name, icon, target, deadline }); }
+        save(); render(); openGoal(id); toast('Goal saved');
+      });
+    });
+  }
+  function openGoal(id) {
+    const g = db.goals.find((x) => x.id === id);
+    if (!g) return;
+    const s = goalSaved(g), pct = Math.min(100, (s / g.target) * 100);
+    const moves = [...g.moves].sort((a, b) => b.date.localeCompare(a.date) || (b.created || 0) - (a.created || 0));
+    openSheet(`${g.icon} ${g.name}`, `
+      <div>
+        <div class="big-num">${fmt(s)} <small style="font-size:16px">of ${fmt(g.target)}</small></div>
+        <div class="track" style="margin-top:8px"><div class="fill" style="width:${pct}%"></div></div>
+        <div class="budget-status"><span>${s >= g.target ? '🎉 Goal reached!' : fmt(g.target - s) + ' to go'}</span><span>${Math.round(pct)}%</span></div>
+      </div>
+      <div class="actions">
+        <button class="btn primary" data-add>＋ Add money</button>
+        <button class="btn" style="flex:1" data-take ${s > 0 ? '' : 'disabled'}>Take out</button>
+      </div>
+      <div>
+        <div class="field-label" style="margin-bottom:4px">History</div>
+        ${moves.length ? moves.map((m) => `<div class="list-btn"><span class="grow">${m.amount >= 0 ? 'Added' : 'Took out'} ${fmt(Math.abs(m.amount))}<br>
+          <small>${dayLabel(m.date)} · ${m.amount >= 0 ? 'from' : 'to'} ${esc(walName(m.walletId))}</small></span>
+          <button class="icon-btn" data-del-move="${m.id}" aria-label="Remove this entry">✕</button></div>`).join('') : empty('No money added yet.')}
+      </div>
+      <div class="actions">
+        <button class="btn danger" data-del>Delete goal</button>
+        <button class="btn" style="flex:1" data-edit>Edit goal</button>
+      </div>`, (sheet) => {
+      sheet.addEventListener('click', (e) => {
+        if (e.target.closest('[data-add]')) return goalMoney(g, 'add');
+        if (e.target.closest('[data-take]')) return goalMoney(g, 'take');
+        if (e.target.closest('[data-edit]')) return editGoal(g);
+        const dm = e.target.closest('[data-del-move]');
+        if (dm) {
+          if (!confirm('Remove this entry? The wallet balance will be corrected.')) return;
+          g.moves = g.moves.filter((m) => m.id !== dm.dataset.delMove);
+          save(); render(); return openGoal(g.id);
+        }
+        if (e.target.closest('[data-del]')) {
+          if (!confirm(`Delete "${g.name}"?${s > 0 ? ` The ${fmt(s)} saved in it goes back to the wallets it came from.` : ''}`)) return;
+          db.goals = db.goals.filter((x) => x.id !== g.id);
+          save(); closeSheet(); render(); toast('Goal deleted');
+        }
+      });
+    });
+  }
+  function goalMoney(g, mode) {
+    const s = goalSaved(g);
+    let wid = usableWallet(db.prefs.goalWallet || 'w_salary');
+    openSheet(mode === 'add' ? `Add to ${g.name}` : `Take out of ${g.name}`, `
+      <label class="amount-field"><span>₹</span><input id="m-amt" inputmode="decimal" placeholder="0" aria-label="Amount" value="${mode === 'take' ? s : ''}"></label>
+      <div class="field-label">${mode === 'add' ? 'Take it from' : 'Put it back in'}</div>
+      ${walletChipsHtml(wid)}
+      <label class="field">Date<input class="input" type="date" id="m-date" value="${todayStr()}"></label>
+      <div class="err" id="m-err"></div>
+      <div class="actions"><button class="btn" data-back>Back</button><button class="btn primary" data-save>Save</button></div>`, (sheet) => {
+      setTimeout(() => $('#m-amt', sheet)?.focus(), 50);
+      pickWallet(sheet, (w) => { wid = w; });
+      sheet.addEventListener('click', (e) => {
+        if (e.target.closest('[data-back]')) return openGoal(g.id);
+        if (!e.target.closest('[data-save]')) return;
+        const a = parseAmt($('#m-amt', sheet).value), date = $('#m-date', sheet).value, err = $('#m-err', sheet);
+        if (!(a > 0)) { err.textContent = 'Enter an amount greater than 0.'; return; }
+        if (mode === 'take' && a > s) { err.textContent = `Only ${fmt(s)} is saved in this goal.`; return; }
+        if (!date) { err.textContent = 'Pick a date.'; return; }
+        if (!wid) { err.textContent = 'Pick a wallet.'; return; }
+        g.moves.push({ id: uid(), amount: mode === 'add' ? a : -a, walletId: wid, date, created: Date.now() });
+        db.prefs.goalWallet = wid;
+        save(); render(); openGoal(g.id);
+        toast(mode === 'add' ? `Added ${fmt(a)} to ${g.name}` : `Took ${fmt(a)} out`);
+      });
+    });
+  }
+
+  /* ---------- lent & borrowed ---------- */
+  function editLoan(l, kind) {
+    const isNew = !l;
+    const f = l ? { ...l } : { kind: kind || 'lent', person: '', amount: '', walletId: null, date: todayStr(), due: '', note: '' };
+    f.walletId = usableWallet(f.walletId || db.prefs.expenseWallet);
+    const people = [...new Set(db.loans.map((x) => x.person))];
+    const body = () => `
+      <div class="seg" role="group" aria-label="Type">
+        <button type="button" data-k="lent" aria-pressed="${f.kind === 'lent'}">I lent money</button>
+        <button type="button" data-k="borrowed" aria-pressed="${f.kind === 'borrowed'}">I borrowed money</button>
+      </div>
+      <label class="amount-field"><span>₹</span><input id="l-amt" inputmode="decimal" placeholder="0" aria-label="Amount" value="${esc(f.amount)}"></label>
+      <label class="field">${f.kind === 'lent' ? 'Who did you give it to?' : 'Who did you get it from?'}
+        <input class="input" id="l-person" maxlength="30" list="l-people" placeholder="Name" value="${esc(f.person)}"></label>
+      <datalist id="l-people">${people.map((p) => `<option value="${esc(p)}">`).join('')}</datalist>
+      <div class="field-label">${f.kind === 'lent' ? 'Paid from' : 'Received in'}</div>
+      ${walletChipsHtml(f.walletId)}
+      <div class="row2">
+        <label class="field">Date<input class="input" type="date" id="l-date" value="${esc(f.date)}"></label>
+        <label class="field">Settle by (optional)<input class="input" type="date" id="l-due" value="${esc(f.due || '')}"></label>
+      </div>
+      <label class="field">Note<input class="input" id="l-note" maxlength="80" placeholder="Optional" value="${esc(f.note || '')}"></label>
+      <div class="err" id="l-err"></div>
+      <button class="btn primary block" data-save>Save</button>`;
+    const sync = (r) => {
+      f.amount = $('#l-amt', r).value; f.person = $('#l-person', r).value;
+      f.date = $('#l-date', r).value; f.due = $('#l-due', r).value; f.note = $('#l-note', r).value;
+    };
+    openSheet(isNew ? 'Lend or borrow' : 'Edit', body(), (sheet) => {
+      const sb = $('.sheet-body', sheet);
+      if (isNew) setTimeout(() => $('#l-amt', sb)?.focus(), 50);
+      sb.addEventListener('click', (e) => {
+        const k = e.target.closest('[data-k]');
+        if (k) { sync(sb); f.kind = k.dataset.k; sb.innerHTML = body(); return; }
+        const w = e.target.closest('[data-w]');
+        if (w) { f.walletId = w.dataset.w; $$('[data-w]', sb).forEach((x) => x.setAttribute('aria-pressed', x === w)); return; }
+        if (!e.target.closest('[data-save]')) return;
+        sync(sb);
+        const amount = parseAmt(f.amount), person = f.person.trim(), err = $('#l-err', sb);
+        if (!(amount > 0)) { err.textContent = 'Enter an amount greater than 0.'; return; }
+        if (!person) { err.textContent = 'Enter a name.'; return; }
+        if (!f.date) { err.textContent = 'Pick a date.'; return; }
+        if (!f.walletId) { err.textContent = 'Pick a wallet.'; return; }
+        if (!isNew && amount < loanPaid(l)) { err.textContent = `${fmt(loanPaid(l))} has already been paid back, so the amount can't be less than that.`; return; }
+        const data = { kind: f.kind, person, amount, walletId: f.walletId, date: f.date, due: f.due || '', note: f.note.trim() };
+        let id;
+        if (isNew) { id = 'l' + uid(); db.loans.push({ id, ...data, payments: [], created: Date.now() }); }
+        else { id = l.id; Object.assign(l, data); }
+        save(); render(); openLoan(id); toast('Saved');
+      });
+    });
+  }
+  function openLoan(id) {
+    const l = db.loans.find((x) => x.id === id);
+    if (!l) return;
+    const paid = loanPaid(l), left = loanLeft(l), pct = Math.min(100, (paid / l.amount) * 100);
+    const pays = [...l.payments].sort((a, b) => b.date.localeCompare(a.date) || (b.created || 0) - (a.created || 0));
+    openSheet(loanTitle(l), `
+      <div>
+        <div class="big-num">${fmt(left)} <small style="font-size:16px">${left > 0 ? 'left' : 'settled ✓'}</small></div>
+        <div class="note">${l.kind === 'lent' ? 'You lent' : 'You borrowed'} ${fmt(l.amount)} on ${dayLabel(l.date)} (${esc(walName(l.walletId))})${l.due ? ` · settle by ${dayLabel(l.due)}` : ''}${l.note ? ' · ' + esc(l.note) : ''}</div>
+        <div class="track" style="margin-top:8px"><div class="fill" style="width:${pct}%"></div></div>
+        <div class="budget-status"><span>${fmt(paid)} paid back</span><span>${Math.round(pct)}%</span></div>
+      </div>
+      ${left > 0 ? `<button class="btn primary block" data-pay>${l.kind === 'lent' ? `${esc(l.person)} paid me back` : `I paid ${esc(l.person)} back`}</button>` : ''}
+      <div>
+        <div class="field-label" style="margin-bottom:4px">Payments</div>
+        ${pays.length ? pays.map((p) => `<div class="list-btn"><span class="grow">${fmt(p.amount)}<br><small>${dayLabel(p.date)} · ${esc(walName(p.walletId))}</small></span>
+          <button class="icon-btn" data-del-pay="${p.id}" aria-label="Remove payment">✕</button></div>`).join('') : empty('No payments yet.')}
+      </div>
+      <div class="actions">
+        <button class="btn danger" data-del>Delete</button>
+        <button class="btn" style="flex:1" data-edit>Edit</button>
+      </div>`, (sheet) => {
+      sheet.addEventListener('click', (e) => {
+        if (e.target.closest('[data-pay]')) return loanPayment(l);
+        if (e.target.closest('[data-edit]')) return editLoan(l);
+        const dp = e.target.closest('[data-del-pay]');
+        if (dp) {
+          if (!confirm('Remove this payment?')) return;
+          l.payments = l.payments.filter((p) => p.id !== dp.dataset.delPay);
+          save(); render(); return openLoan(l.id);
+        }
+        if (e.target.closest('[data-del]')) {
+          if (!confirm('Delete this record and all its payments? Wallet balances will be corrected.')) return;
+          db.loans = db.loans.filter((x) => x.id !== l.id);
+          save(); closeSheet(); render(); toast('Deleted');
+        }
+      });
+    });
+  }
+  function loanPayment(l) {
+    const left = loanLeft(l);
+    let wid = usableWallet(l.walletId);
+    openSheet(l.kind === 'lent' ? `${l.person} paid back` : `Paying back ${l.person}`, `
+      <label class="amount-field"><span>₹</span><input id="p-amt" inputmode="decimal" aria-label="Amount" value="${left}"></label>
+      <p class="note" style="margin:-6px 0 0">${fmt(left)} is left. Change the amount if this is a part payment.</p>
+      <div class="field-label">${l.kind === 'lent' ? 'Received in' : 'Paid from'}</div>
+      ${walletChipsHtml(wid)}
+      <label class="field">Date<input class="input" type="date" id="p-date" value="${todayStr()}"></label>
+      <div class="err" id="p-err"></div>
+      <div class="actions"><button class="btn" data-back>Back</button><button class="btn primary" data-save>Save</button></div>`, (sheet) => {
+      pickWallet(sheet, (w) => { wid = w; });
+      sheet.addEventListener('click', (e) => {
+        if (e.target.closest('[data-back]')) return openLoan(l.id);
+        if (!e.target.closest('[data-save]')) return;
+        const a = parseAmt($('#p-amt', sheet).value), date = $('#p-date', sheet).value, err = $('#p-err', sheet);
+        if (!(a > 0)) { err.textContent = 'Enter an amount greater than 0.'; return; }
+        if (a > left) { err.textContent = `Only ${fmt(left)} is left.`; return; }
+        if (!date) { err.textContent = 'Pick a date.'; return; }
+        if (!wid) { err.textContent = 'Pick a wallet.'; return; }
+        l.payments.push({ id: uid(), amount: a, walletId: wid, date, created: Date.now() });
+        save(); render(); openLoan(l.id);
+        toast(loanLeft(l) <= 0 ? 'All settled 🎉' : 'Payment saved');
+      });
+    });
+  }
+
   /* ---------- backup ---------- */
   function download(name, text, mime) {
     const a = document.createElement('a');
@@ -762,6 +1169,11 @@
     const rows = [['Date', 'Type', 'Category', 'From wallet', 'To wallet', 'Amount', 'Note']];
     for (const t of sortTx(db.transactions)) {
       rows.push([t.date, t.type, t.type === 'transfer' ? '' : cat(t.categoryId)?.name || '', walName(t.walletId), t.toWalletId ? walName(t.toWalletId) : '', t.amount, t.note || '']);
+    }
+    const LBL = { lent: 'lent', borrowed: 'borrowed', got: 'paid back to you', paid: 'you paid back', add: 'to savings goal', take: 'from savings goal' };
+    for (const e of sortTx(extraEvents())) {
+      const out = EXTRA_SIGN[e.sub] < 0;
+      rows.push([e.date, LBL[e.sub], e.person, out ? walName(e.walletId) : '', out ? '' : walName(e.walletId), e.amount, e.note || '']);
     }
     download(`hisab-${todayStr()}.csv`, '﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n'), 'text/csv');
   }
@@ -795,13 +1207,24 @@
     if (!b || b.closest('#sheet')) return;
     const a = b.dataset.act;
     switch (a) {
-      case 'tab': go(b.dataset.tab); break;
+      case 'tab': if (b.dataset.plan) ui.plan = b.dataset.plan; go(b.dataset.tab); break;
+      case 'plan': ui.plan = b.dataset.k; render(); break;
+      case 'goal-new': editGoal(); break;
+      case 'goal': openGoal(b.dataset.id); break;
+      case 'loan-new': editLoan(null, b.dataset.k); break;
+      case 'loan': openLoan(b.dataset.id); break;
+      case 'hist-range':
+        ui.hist.range = b.dataset.k;
+        if (b.dataset.k === 'custom' && !ui.hist.from) {
+          ui.hist.from = `${ui.month}-01`;
+          ui.hist.to = ui.month === thisMonth() ? todayStr() : `${ui.month}-${pad(daysIn(ui.month))}`;
+        }
+        render(); break;
       case 'month': ui.month = addMonth(ui.month, Number(b.dataset.k)); ui.trendSel = null; render(); break;
       case 'new': openTxForm({ type: b.dataset.type, categoryId: b.dataset.cat }); break;
       case 'edit': openTxForm({ id: b.dataset.id }); break;
-      case 'wallet-hist': ui.hist = { type: 'all', wallet: b.dataset.id, cat: null, q: '' }; go('hist'); break;
-      case 'cat-hist': ui.hist = { type: ui.statsType, wallet: 'all', cat: b.dataset.id, q: '' }; go('hist'); break;
-      case 'clear-cat': ui.hist.cat = null; render(); break;
+      case 'wallet-hist': ui.hist = resetHist({ wallet: b.dataset.id }); go('hist'); break;
+      case 'cat-hist': ui.hist = resetHist({ type: ui.statsType, cat: b.dataset.id }); go('hist'); break;
       case 'hist-type': ui.hist.type = b.dataset.k; render(); break;
       case 'stats-type': ui.statsType = b.dataset.k; render(); break;
       case 'set-budgets': openBudgets(); break;

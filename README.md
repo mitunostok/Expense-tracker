@@ -9,9 +9,11 @@ A small web app for tracking money. It works on your phone, works offline, and n
 - **Expenses:** 16 ready-made categories, plus any custom category (name and emoji) you add while entering an expense.
 - **Income:** Salary, Freelance, Business, Bonus and more, plus your own categories.
 - **Budgets:** a monthly limit per category. Bars turn yellow at 80% and red when you go over, and alerts show on the home screen.
-- **Reports:** spending or income by category, split by wallet, and a 6‑month income vs spending chart.
+- **Reports:** spending or income by category, split by wallet, a comparison with last month (which categories went up or down), and a 6‑month income vs spending chart.
+- **Savings goals:** for example "New phone: ₹10,000 by March". Add money from a wallet whenever you can, and the app shows how much you need per month to get there.
+- **Lent & borrowed:** "Rahul owes you ₹200" or "You owe Amit ₹1,000". Record part payments and set a settle-by date. Pending and overdue ones show on the home screen.
 - **Repeating entries:** tick "Repeat every month" (for example on your salary or rent) and it is added automatically every month.
-- **History:** browse by month, filter by type or wallet, and search notes.
+- **History:** browse by month or any date range, filter by type, wallet or category, search notes and names, and see totals for the filtered list.
 - **Backup:** save and restore a backup file, or export to CSV for Excel or Google Sheets.
 - Light and dark mode, ₹ amounts formatted in the Indian style (1,50,000).
 
